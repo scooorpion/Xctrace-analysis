@@ -2,8 +2,10 @@
 
 import argparse
 import json
+import shlex
 import subprocess
 import sys
+import time
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -37,6 +39,57 @@ IMPORTANT_OPTIONAL_TABLES = [
     "time-sample",
 ]
 
+DEFAULT_EXPORT_RETRIES = 2
+RETRY_DELAY_SECONDS = 1.0
+
+
+class XctraceExportError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        command: list[str],
+        output_path: Path,
+        table: str | None,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        attempts: int,
+    ) -> None:
+        self.command = command
+        self.output_path = output_path
+        self.table = table
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+        self.attempts = attempts
+        super().__init__(self.describe())
+
+    def describe(self) -> str:
+        scope = self.table or "toc"
+        lines = [
+            f"xctrace export failed for {scope} after {self.attempts} attempt(s) with exit code {self.returncode}",
+            f"command: {shlex.join(self.command)}",
+            f"output: {self.output_path}",
+        ]
+        stderr = self.stderr.strip()
+        stdout = self.stdout.strip()
+        if stderr:
+            lines.append(f"stderr:\n{stderr}")
+        elif stdout:
+            lines.append(f"stdout:\n{stdout}")
+        return "\n".join(lines)
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "table": self.table,
+            "returncode": self.returncode,
+            "attempts": self.attempts,
+            "output": str(self.output_path),
+            "command": self.command,
+            "stdout": self.stdout.strip(),
+            "stderr": self.stderr.strip(),
+        }
+
 
 class Resolver:
     def __init__(self) -> None:
@@ -68,29 +121,92 @@ class Resolver:
         return text or default
 
 
-def run_xctrace_export(trace_path: Path, output_path: Path, xpath: str | None = None) -> None:
+def cleanup_partial_export(output_path: Path) -> None:
+    try:
+        output_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def run_xctrace_export(
+    trace_path: Path,
+    output_path: Path,
+    xpath: str | None = None,
+    *,
+    table: str | None = None,
+    retries: int = DEFAULT_EXPORT_RETRIES,
+) -> None:
     command = ["xcrun", "xctrace", "export", "--input", str(trace_path), "--output", str(output_path)]
     if xpath is None:
         command.append("--toc")
     else:
         command.extend(["--xpath", xpath])
-    subprocess.run(command, check=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    max_attempts = max(1, retries + 1)
+    last_error: XctraceExportError | None = None
+
+    for attempt in range(1, max_attempts + 1):
+        cleanup_partial_export(output_path)
+        result = subprocess.run(command, capture_output=True, text=True)
+        output_exists = output_path.exists()
+        output_empty = output_exists and output_path.stat().st_size == 0
+
+        if result.returncode == 0 and output_exists and not output_empty:
+            return
+
+        stderr = result.stderr or ""
+        if result.returncode == 0 and output_empty:
+            if stderr:
+                stderr += "\n"
+            stderr += "xctrace reported success but produced an empty export file."
+
+        last_error = XctraceExportError(
+            command=command,
+            output_path=output_path,
+            table=table,
+            returncode=result.returncode,
+            stdout=result.stdout or "",
+            stderr=stderr,
+            attempts=attempt,
+        )
+        cleanup_partial_export(output_path)
+
+        if attempt < max_attempts:
+            time.sleep(RETRY_DELAY_SECONDS * attempt)
+
+    if last_error is not None:
+        raise last_error
+
+    raise RuntimeError("unreachable")
 
 
 def export_tables(
-    trace_path: Path, output_dir: Path, base_name: str, tables: list[str], available_tables: set[str]
-) -> dict[str, Path]:
+    trace_path: Path,
+    output_dir: Path,
+    base_name: str,
+    tables: list[str],
+    available_tables: set[str],
+    *,
+    retries: int,
+) -> tuple[dict[str, Path], list[dict[str, object]]]:
     outputs: dict[str, Path] = {}
+    failures: list[dict[str, object]] = []
 
     for table in tables:
         if table not in available_tables:
             continue
         out_path = output_dir / f"{base_name}-{table}.xml"
         xpath = f'/trace-toc/run[@number="1"]/data/table[@schema="{table}"]'
-        run_xctrace_export(trace_path, out_path, xpath=xpath)
+        try:
+            run_xctrace_export(trace_path, out_path, xpath=xpath, table=table, retries=retries)
+        except XctraceExportError as exc:
+            print(exc.describe(), file=sys.stderr)
+            failures.append(exc.to_dict())
+            continue
         outputs[table] = out_path
 
-    return outputs
+    return outputs, failures
 
 
 def parse_trace_info(toc_path: Path) -> dict:
@@ -480,11 +596,16 @@ def parse_runloop_events(xml_path: Path) -> dict:
 
 
 def build_summary(
-    exports: dict[str, Path], trace_info: dict, requested_tables: list[str], available_tables: set[str]
+    exports: dict[str, Path],
+    trace_info: dict,
+    requested_tables: list[str],
+    available_tables: set[str],
+    failed_exports: list[dict[str, object]],
 ) -> dict:
     exported_tables = [name for name in exports.keys() if name != "toc"]
     unavailable_requested_tables = [table for table in requested_tables if table not in available_tables]
     unexported_available_tables = sorted(table for table in available_tables if table not in exported_tables)
+    failed_requested_tables = [str(item["table"]) for item in failed_exports if item.get("table")]
 
     summary: dict[str, object] = {
         "trace": trace_info,
@@ -497,6 +618,8 @@ def build_summary(
             "important_unexported_available_tables": [
                 table for table in IMPORTANT_OPTIONAL_TABLES if table in unexported_available_tables
             ],
+            "failed_requested_tables": failed_requested_tables,
+            "failed_exports": failed_exports,
         },
     }
 
@@ -557,6 +680,12 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Schema name to skip. Repeat for multiple tables.",
     )
+    parser.add_argument(
+        "--export-retries",
+        type=int,
+        default=DEFAULT_EXPORT_RETRIES,
+        help="How many times to retry a failed xctrace export before giving up on that table.",
+    )
     return parser.parse_args()
 
 
@@ -585,15 +714,23 @@ def main() -> int:
 
     try:
         toc_path = output_dir / f"{base_name}-toc.xml"
-        run_xctrace_export(trace_path, toc_path, xpath=None)
+        run_xctrace_export(trace_path, toc_path, xpath=None, retries=args.export_retries)
         trace_info = parse_trace_info(toc_path)
         available_tables = set(trace_info.get("tables", []))
         exports = {"toc": toc_path}
-        exports.update(export_tables(trace_path, output_dir, base_name, tables, available_tables))
-        summary = build_summary(exports, trace_info, tables, available_tables)
-    except subprocess.CalledProcessError as exc:
-        print(f"xctrace export failed with exit code {exc.returncode}", file=sys.stderr)
-        return exc.returncode
+        exported_tables, failed_exports = export_tables(
+            trace_path,
+            output_dir,
+            base_name,
+            tables,
+            available_tables,
+            retries=args.export_retries,
+        )
+        exports.update(exported_tables)
+        summary = build_summary(exports, trace_info, tables, available_tables, failed_exports)
+    except XctraceExportError as exc:
+        print(exc.describe(), file=sys.stderr)
+        return exc.returncode or 1
 
     summary_path = output_dir / f"{base_name}-trace-summary.json"
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2))
@@ -603,6 +740,7 @@ def main() -> int:
         "output_dir": str(output_dir),
         "summary": str(summary_path),
         "exports": {name: str(path) for name, path in exports.items()},
+        "failed_exports": failed_exports,
     }
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
     return 0
