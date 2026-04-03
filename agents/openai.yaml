@@ -1,0 +1,4 @@
+interface:
+  display_name: "Xctrace Trace Analysis"
+  short_description: "Comprehensive Instruments trace export and coverage"
+  default_prompt: "Use $xctrace-trace-analysis to export a .trace file, summarize the important performance tables, and report what coverage is still missing."
