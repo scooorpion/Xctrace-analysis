@@ -140,4 +140,4 @@ The summary JSON includes:
 
 ## License
 
-This repository does not include a license file by default. Choose and add one before public release if you want to define reuse terms.
+MIT
