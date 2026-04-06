@@ -136,4 +136,4 @@ python3 scripts/analyze_trace.py /path/to/file.trace --skip-table swiftui-causes
 
 ## License
 
-仓库默认不包含许可证文件。如果你要公开发布，建议在发布前补上合适的开源许可证。
+MIT
